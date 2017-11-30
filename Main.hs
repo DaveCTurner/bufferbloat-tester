@@ -116,6 +116,7 @@ main = withSocketsDo $ getRecord "bufferbloat-tester" >>= \case
               let fixChar c = if c `elem` ("T:" :: String) then '.' else c
               now <- map fixChar <$> formatISO8601Millis <$> liftIO getCurrentTime
               let logFileName = "bufferbloat-tester-" ++ now ++ ".log"
+              liftIO $ putStrLn $ "Starting run, logging to " ++ logFileName
               (yield rm >> awaitForever yield)
                 =$= DCL.map formatTabSeparated
                 =$= (awaitForever yield >> yield (T.encodeUtf8 "Finished\n"))
