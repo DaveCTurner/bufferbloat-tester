@@ -5,6 +5,8 @@
 
 module Main where
 
+import Control.Concurrent (threadDelay)
+import Data.Monoid
 import Control.Exception
 import Control.Monad
 import Control.Monad.IO.Class
@@ -13,12 +15,13 @@ import Data.Binary.Get
 import Data.ByteString.Builder
 import Data.ByteString.Builder.Extra
 import Data.Conduit
-import Data.Conduit.Binary
+import Data.Conduit.Binary hiding (drop)
 import Data.Conduit.ByteString.Builder
 import Data.Conduit.Network.UDP
 import Data.Time
 import Data.Time.ISO8601
 import Data.Word
+import Data.Int
 import Network.Socket
 import Options.Applicative
 import Options.Generic
@@ -32,7 +35,10 @@ import qualified Data.Text.Encoding as T
 
 data Options
   = Server { listenPort :: String }
-  | Client { remoteAddr :: String }
+  | Client { remoteAddr :: String
+           , durationSecs :: Int
+           , rateBytesPerSec :: Int
+           }
   deriving (Generic, Show)
 
 instance ParseRecord Options
@@ -55,17 +61,17 @@ main :: IO ()
 main = withSocketsDo $ getRecord "bufferbloat-tester" >>= \case
   Server{..} -> do
 
+    let hints = defaultHints
+          { addrFlags = [AI_PASSIVE]
+          , addrFamily = AF_INET
+          , addrSocketType = Datagram
+          }
+
+    addrs <- getAddrInfo (Just hints) Nothing (Just listenPort)
+
     bracket (socket AF_INET Datagram defaultProtocol)
             (close)
             $ \sock -> do
-
-      let hints = defaultHints
-            { addrFlags = [AI_PASSIVE]
-            , addrFamily = AF_INET
-            , addrSocketType = Datagram
-            }
-
-      addrs <- getAddrInfo (Just hints) Nothing (Just listenPort)
 
       bind sock $ addrAddress $ addrs !! 0
 
@@ -131,4 +137,57 @@ main = withSocketsDo $ getRecord "bufferbloat-tester" >>= \case
 
   Client{..} -> do
 
-    error "TODO"
+    bracket (socket AF_INET Datagram defaultProtocol)
+            (close)
+            $ \sock -> do
+
+      let (host, colonPort) = break (== ':') remoteAddr
+
+      let hints = defaultHints
+            { addrFlags = []
+            , addrFamily = AF_INET
+            , addrSocketType = Datagram
+            }
+
+      addrs <- getAddrInfo (Just hints) (Just host) (Just $ drop 1 colonPort)
+      let destination = addrAddress $ addrs !! 0
+
+      startTimeNsec <- toNanoSecs <$> getTime Monotonic
+
+      let maxBucketLevel = 1000000
+          durationNSec = fromIntegral durationSecs * 1000000000
+
+      let generatePackets sequenceNumber lastBucketLevel lastSendTimeNsec = do
+            now <- liftIO $ getTime Monotonic
+            let nowNsec = toNanoSecs now
+            when (nowNsec - startTimeNsec < durationNSec) $
+
+              let nextBucketLevel = lastBucketLevel
+                        - (fromIntegral rateBytesPerSec * (nowNsec - lastSendTimeNsec))
+                            `div` 1000000000
+                        + 1024
+
+              in if nextBucketLevel > maxBucketLevel
+                  then do
+                    liftIO $ threadDelay 10000
+                    generatePackets sequenceNumber lastBucketLevel lastSendTimeNsec
+
+                  else do
+                    yield $ BL.toStrict $ toLazyByteString
+                                $  int64BE (sec  now)
+                                <> int64BE (nsec now)
+                                <> word64BE sequenceNumber
+                                <> padding
+                    generatePackets (sequenceNumber + 1) nextBucketLevel nowNsec
+
+      bracket (socket AF_INET Datagram defaultProtocol)
+              (close)
+              $ \sock ->
+
+        runConduit $ generatePackets 0 1000000 startTimeNsec
+          =$= (awaitForever yield >> yield (T.encodeUtf8 "DONE"))
+          =$= DCL.map (\msg -> Message msg destination)
+          =$= sinkToSocket sock
+
+padding :: Builder
+padding = byteString (B.replicate 1000 0x40)
